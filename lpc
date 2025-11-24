@@ -1,0 +1,197 @@
+import sys
+import json
+import time
+import os
+import csv
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+import requests
+
+
+def fetch_nr_tick(symbol: str = "NR2601") -> Dict[str, Any]:
+    full_symbol = f"nf_{symbol}"
+    url = f"https://hq.sinajs.cn/list={full_symbol}"
+
+    headers = {
+        "Referer": "https://finance.sina.com.cn/",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.0 Safari/605.1.15"
+        ),
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+
+    resp = requests.get(url, headers=headers, timeout=5)
+    resp.encoding = "gbk"
+    text = resp.text.strip()
+
+    prefix = f"var hq_str_{full_symbol}="
+    if not text.startswith(prefix):
+        raise RuntimeError(f"Unexpected response header: {text[:120]}")
+
+    first_quote = text.find('"')
+    last_quote = text.rfind('"')
+    if first_quote == -1 or last_quote <= first_quote:
+        raise RuntimeError(f"Cannot find quoted payload: {text}")
+
+    payload = text[first_quote + 1:last_quote]
+    fields = [p.strip() for p in payload.split(",")]
+
+    if len(fields) < 9:
+        raise RuntimeError(f"Too few fields ({len(fields)}): {payload}")
+
+    last_str = fields[8]
+    try:
+        last_val: Optional[float] = float(last_str) if last_str != "" else None
+    except ValueError:
+        last_val = None
+
+    tick = {
+        "last": last_val
+    }
+
+    return tick
+
+
+def fetch_nr_kline(symbol: str = "NR2601",
+                   freq: str = "1d") -> List[Dict[str, Any]]:
+    base = "http://stock2.finance.sina.com.cn/futures/api/json.php/IndexService"
+    if freq == "1d":
+        url = f"{base}.getInnerFuturesDailyKLine?symbol={symbol}"
+    else:
+        url = f"{base}.getInnerFuturesMiniKLine{freq}?symbol={symbol}"
+
+    headers = {
+        "Referer": "https://finance.sina.com.cn/",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.0 Safari/605.1.15"
+        ),
+    }
+
+    r = requests.get(url, headers=headers, timeout=5)
+    r.raise_for_status()
+
+    try:
+        data = r.json()
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse JSON from {url}: {e}, text={r.text[:200]}")
+
+    bars: List[Dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, list) or len(row) < 6:
+            continue
+
+        ts = row[0]
+        try:
+            open_ = float(row[1])
+            high = float(row[2])
+            low = float(row[3])
+            close = float(row[4])
+            volume = float(row[5])
+        except (ValueError, TypeError):
+            continue
+
+        oi: Optional[float] = None
+        if len(row) > 6 and row[6] not in ("", None):
+            try:
+                oi = float(row[6])
+            except (ValueError, TypeError):
+                oi = None
+
+        bars.append({
+            "datetime": ts,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+            "open_interest": oi,
+        })
+
+    return bars
+
+
+def main() -> None:
+    # CLI: symbol [freq] [interval_seconds]
+    symbol = sys.argv[1] if len(sys.argv) >= 2 else "NR2601"
+    freq = sys.argv[2] if len(sys.argv) >= 3 else None
+
+    if len(sys.argv) >= 4:
+        try:
+            interval = float(sys.argv[3])
+        except ValueError:
+            interval = 3.0
+    else:
+        interval = 3.0
+
+    if freq is not None:
+        print(f"K-line ({symbol}, {freq}) – last few bars:")
+        try:
+            bars = fetch_nr_kline(symbol, freq)
+            tail = bars[-5:] if len(bars) > 5 else bars
+            print(json.dumps(tail, ensure_ascii=False, indent=2))
+        except Exception as e:
+            print(f"[KLINE ERROR] {e}")
+        print("\n--- Start collecting last prices for CSV ---\n")
+
+    # Prepare folder "last price" in the same directory as this script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(script_dir, "last price")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # CSV filename with timestamp and symbol
+    ts_now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_filename = f"{symbol}_last_{ts_now}.csv"
+    csv_path = os.path.join(out_dir, csv_filename)
+
+    # Collect 1500 samples
+    max_samples = 1500
+    times: List[str] = []
+    lasts: List[Optional[float]] = []
+
+    print(f"Collecting {max_samples} samples for {symbol} at interval={interval} seconds...")
+    print(f"CSV will be saved to: {csv_path}")
+
+    try:
+        while len(times) < max_samples:
+            try:
+                tick = fetch_nr_tick(symbol)
+                local_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                last_val = tick.get("last")
+
+                times.append(local_time)
+                lasts.append(last_val)
+
+                print(f"{len(times)}/{max_samples}  time={local_time}, last={last_val}")
+            except Exception as e:
+                print(f"[TICK ERROR] {e}")
+                # Don't increment sample count on error; just retry next loop
+                time.sleep(interval)
+                continue
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Writing what has been collected so far...")
+
+    # If interrupted early, still write whatever we have:
+    # pad with empty strings if you *really* want exactly 1500 cells
+    if len(times) < max_samples:
+        missing = max_samples - len(times)
+        times.extend([""] * missing)
+        lasts.extend([""] * missing)
+
+    # Write CSV: first row = times, second row = lasts
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(times)
+        writer.writerow(lasts)
+
+    print(f"\nDone. CSV saved to:\n{csv_path}")
+
+
+if __name__ == "__main__":
+    main()

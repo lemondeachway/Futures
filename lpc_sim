@@ -1,0 +1,469 @@
+import sys
+import os
+import csv
+import time
+import random
+import tkinter as tk
+from tkinter import ttk
+from datetime import datetime, date, time as dtime, timedelta
+from typing import List, Optional, Tuple
+
+
+def generate_sim_price(last_price: Optional[int]) -> int:
+    """
+    Random-walk simulator for last price.
+    Tick size is 5, prices are integers with no decimals.
+    """
+    if last_price is None:
+        return 12000  # starting level
+
+    # Random step in ticks: -3, -2, -1, 0, 1, 2, 3
+    tick_step = random.randint(-3, 3)
+    new_price = last_price + tick_step * 5
+
+    # Prevent non-positive prices
+    if new_price <= 0:
+        new_price = 5
+
+    # Ensure multiple of 5
+    new_price = int(round(new_price / 5) * 5)
+
+    return new_price
+
+
+SESSIONS = [
+    (9 * 60, 11 * 60 + 30, "morning"),     # 09:00–11:30
+    (13 * 60 + 30, 15 * 60, "afternoon"),  # 13:30–15:00
+    (21 * 60, 23 * 60, "night"),           # 21:00–23:00
+]
+
+
+def get_session_label(dt: datetime) -> Optional[str]:
+    minutes = dt.hour * 60 + dt.minute
+    for start, end, name in SESSIONS:
+        if start <= minutes <= end:
+            return name
+    return None
+
+
+def advance_to_next_session(dt: datetime) -> datetime:
+    """
+    If dt is outside all sessions, jump to the start of the next one.
+    If past night session, jump to next day 09:00.
+    """
+    minutes = dt.hour * 60 + dt.minute
+
+    for start, end, name in SESSIONS:
+        if minutes < start:
+            return dt.replace(
+                hour=start // 60,
+                minute=start % 60,
+                second=0,
+                microsecond=0,
+            )
+
+    # Past the last session: move to next day morning
+    next_day = dt + timedelta(days=1)
+    return next_day.replace(
+        hour=9,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
+def load_existing_csv(path: str) -> Tuple[List[str], List[Optional[int]]]:
+    if not os.path.exists(path):
+        return [], []
+
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+
+    if len(rows) < 2:
+        return [], []
+
+    times = rows[0]
+    lasts_raw = rows[1]
+
+    lasts: List[Optional[int]] = []
+    for v in lasts_raw:
+        if v == "":
+            lasts.append("")
+        else:
+            try:
+                lasts.append(int(v))
+            except ValueError:
+                lasts.append("")  # treat weird data as empty
+
+    if len(times) != len(lasts):
+        n = min(len(times), len(lasts))
+        times = times[:n]
+        lasts = lasts[:n]
+
+    return times, lasts
+
+
+def write_csv(path: str, times: List[str], lasts: List[Optional[int]]) -> None:
+    n = min(len(times), len(lasts))
+    times = times[:n]
+    lasts = lasts[:n]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(times)
+        row2 = [("" if v in ("", None) else str(v)) for v in lasts]
+        writer.writerow(row2)
+
+
+class SimApp:
+    def __init__(self, root: tk.Tk, symbol: str = "NR2601", interval: float = 0.5) -> None:
+        self.root = root
+        self.symbol = symbol
+        self.interval = interval  # seconds per simulated step
+        self.running = False
+
+        # File / session state
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.out_dir = os.path.join(script_dir, "lastprice")
+        os.makedirs(self.out_dir, exist_ok=True)
+
+        today = date.today()
+        self.sim_dt = datetime.combine(today, dtime(hour=9, minute=0, second=0))
+
+        self.current_session: Optional[str] = None
+        self.current_csv_path: Optional[str] = None
+        self.times: List[str] = []
+        self.lasts: List[Optional[int]] = []
+        self.last_price: Optional[int] = None
+        self.last_time_str: Optional[str] = None  # last tick's time string
+
+        # Trading system state
+        # Each position: {"side": "long"/"short", "open_time": str, "open_price": int}
+        self.open_positions: List[dict] = []
+        self.settlement: float = 0.0  # sum of all realized diffs
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        # Window name: empty
+        self.root.title("")
+
+        # Top controls
+        control_frame = ttk.Frame(self.root)
+        control_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=4)
+
+        self.start_button = ttk.Button(control_frame, text="Start", command=self.start_sim)
+        self.start_button.pack(side=tk.LEFT, padx=4)
+
+        self.stop_button = ttk.Button(control_frame, text="Stop", command=self.stop_sim)
+        self.stop_button.pack(side=tk.LEFT, padx=4)
+
+        self.status_label = ttk.Label(control_frame, text="Status: stopped")
+        self.status_label.pack(side=tk.LEFT, padx=12)
+
+        # Main frame: left = tick data, right = trading system
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        # Left: price data panel
+        left_frame = ttk.Frame(main_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+
+        left_label = ttk.Label(left_frame, text="Tick Data (Simulated)")
+        left_label.pack(side=tk.TOP, anchor="w")
+
+        columns = ("time", "last")
+        self.tree = ttk.Treeview(left_frame, columns=columns, show="headings", height=20)
+        self.tree.heading("time", text="Local Time")
+        self.tree.heading("last", text="Last Price")
+
+        self.tree.column("time", width=180, anchor=tk.W)
+        self.tree.column("last", width=80, anchor=tk.E)
+
+        vsb_left = ttk.Scrollbar(left_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb_left.set)
+
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb_left.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Right: trading system (position state, buttons, position info)
+        right_frame = ttk.Frame(main_frame)
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False)
+
+        # Position state + settlement
+        state_frame = ttk.LabelFrame(right_frame, text="Position State")
+        state_frame.pack(side=tk.TOP, fill=tk.X, padx=0, pady=(0, 4))
+
+        self.position_label = ttk.Label(state_frame, text="Hold positions: 0 (long: 0, short: 0)")
+        self.position_label.pack(side=tk.TOP, anchor="w", padx=4, pady=2)
+
+        self.settlement_label = ttk.Label(state_frame, text="Settlement: 0")
+        self.settlement_label.pack(side=tk.TOP, anchor="w", padx=4, pady=2)
+
+        # Trading buttons
+        trade_btn_frame = ttk.LabelFrame(right_frame, text="Trading Controls")
+        trade_btn_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+
+        btn_open_long = ttk.Button(trade_btn_frame, text="Open Long", command=self.open_long)
+        btn_open_long.pack(side=tk.LEFT, padx=4, pady=2)
+
+        btn_open_short = ttk.Button(trade_btn_frame, text="Open Short", command=self.open_short)
+        btn_open_short.pack(side=tk.LEFT, padx=4, pady=2)
+
+        btn_close_long = ttk.Button(trade_btn_frame, text="Close Long", command=self.close_long)
+        btn_close_long.pack(side=tk.LEFT, padx=4, pady=2)
+
+        btn_close_short = ttk.Button(trade_btn_frame, text="Close Short", command=self.close_short)
+        btn_close_short.pack(side=tk.LEFT, padx=4, pady=2)
+
+        # Position information panel
+        pos_frame = ttk.LabelFrame(right_frame, text="Position Information")
+        pos_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        pos_columns = ("action", "qty", "time", "price", "diff")
+        self.pos_tree = ttk.Treeview(pos_frame, columns=pos_columns, show="headings", height=15)
+        self.pos_tree.heading("action", text="Action")
+        self.pos_tree.heading("qty", text="Qty")
+        self.pos_tree.heading("time", text="Time")
+        self.pos_tree.heading("price", text="Last")
+        self.pos_tree.heading("diff", text="Diff")
+
+        self.pos_tree.column("action", width=80, anchor=tk.W)
+        self.pos_tree.column("qty", width=40, anchor=tk.E)
+        self.pos_tree.column("time", width=140, anchor=tk.W)
+        self.pos_tree.column("price", width=80, anchor=tk.E)
+        self.pos_tree.column("diff", width=80, anchor=tk.E)
+
+        vsb_pos = ttk.Scrollbar(pos_frame, orient="vertical", command=self.pos_tree.yview)
+        self.pos_tree.configure(yscrollcommand=vsb_pos.set)
+
+        self.pos_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb_pos.pack(side=tk.RIGHT, fill=tk.Y)
+
+    # ----- Simulation control -----
+
+    def start_sim(self) -> None:
+        if not self.running:
+            self.running = True
+            self.status_label.config(text="Status: running")
+            self._schedule_step()
+
+    def stop_sim(self) -> None:
+        self.running = False
+        self.status_label.config(text="Status: stopped")
+
+    def _schedule_step(self) -> None:
+        if self.running:
+            delay_ms = int(self.interval * 1000)
+            self.root.after(delay_ms, self.simulate_step)
+
+    def simulate_step(self) -> None:
+        if not self.running:
+            return
+
+        session = get_session_label(self.sim_dt)
+
+        if session is None:
+            # Outside trading sessions: jump to next session
+            self.sim_dt = advance_to_next_session(self.sim_dt)
+            self.current_session = None
+            self.current_csv_path = None
+            self.times = []
+            self.lasts = []
+            self.last_price = None
+            self.last_time_str = None
+            self.status_label.config(text="Status: waiting for next session...")
+            self._schedule_step()
+            return
+
+        # New session: set up CSV and load previous data if exists
+        if session != self.current_session:
+            self.current_session = session
+            date_str = self.sim_dt.strftime("%Y%m%d")
+            csv_filename = f"{self.symbol}_{date_str}_{self.current_session}_sim.csv"
+            self.current_csv_path = os.path.join(self.out_dir, csv_filename)
+
+            self.times, self.lasts = load_existing_csv(self.current_csv_path)
+
+            # restore last_price / last_time_str from last value if possible
+            if self.times and self.lasts:
+                tail_time = self.times[-1]
+                tail_last = self.lasts[-1]
+                self.last_time_str = tail_time
+                if isinstance(tail_last, int):
+                    self.last_price = tail_last
+                else:
+                    self.last_price = None
+            else:
+                self.last_price = None
+                self.last_time_str = None
+
+            # Refresh tick table with existing data
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            for t_str, v in zip(self.times, self.lasts):
+                self.tree.insert("", tk.END, values=(t_str, v))
+
+            self.status_label.config(
+                text=f"Status: running – session {self.current_session}, file {os.path.basename(self.current_csv_path)}"
+            )
+
+        # Generate new tick
+        self.last_price = generate_sim_price(self.last_price)
+        local_time = self.sim_dt.strftime("%Y-%m-%d %H:%M:%S")
+        self.last_time_str = local_time
+
+        self.times.append(local_time)
+        self.lasts.append(self.last_price)
+
+        # Write to CSV
+        if self.current_csv_path is not None:
+            write_csv(self.current_csv_path, self.times, self.lasts)
+
+        # Update UI tick table
+        self.tree.insert("", tk.END, values=(local_time, self.last_price))
+        self.tree.yview_moveto(1.0)
+
+        # Advance simulated time
+        self.sim_dt = self.sim_dt + timedelta(seconds=self.interval)
+
+        # Schedule next step
+        self._schedule_step()
+
+    # ----- Position / trading management -----
+
+    def _update_position_state_label(self) -> None:
+        total = len(self.open_positions)
+        long_count = sum(1 for p in self.open_positions if p["side"] == "long")
+        short_count = sum(1 for p in self.open_positions if p["side"] == "short")
+        self.position_label.config(
+            text=f"Hold positions: {total} (long: {long_count}, short: {short_count})"
+        )
+
+    def _update_settlement_label(self) -> None:
+        self.settlement_label.config(text=f"Settlement: {self.settlement}")
+
+    def _append_position_row(self, action: str, qty: int, time_str: str, price: Optional[int], diff: Optional[float]) -> None:
+        diff_str = "" if diff is None else f"{diff:.2f}"
+        price_str = "" if price is None else str(price)
+        self.pos_tree.insert("", tk.END, values=(action, qty, time_str, price_str, diff_str))
+        self.pos_tree.yview_moveto(1.0)
+
+    def _current_tick_info(self) -> Optional[Tuple[str, int]]:
+        """
+        Return (time_str, last_price) for the latest tick,
+        or None if no valid tick yet.
+        """
+        if self.last_time_str is None or self.last_price is None:
+            self.status_label.config(text="Status: no tick yet – cannot trade")
+            return None
+        return self.last_time_str, self.last_price
+
+    # ---- Trading actions ----
+
+    def open_long(self) -> None:
+        info = self._current_tick_info()
+        if info is None:
+            return
+        t_str, price = info
+
+        pos = {
+            "side": "long",
+            "open_time": t_str,
+            "open_price": price,
+        }
+        self.open_positions.append(pos)
+
+        self._append_position_row("open long", 1, t_str, price, None)
+        self._update_position_state_label()
+
+    def open_short(self) -> None:
+        info = self._current_tick_info()
+        if info is None:
+            return
+        t_str, price = info
+
+        pos = {
+            "side": "short",
+            "open_time": t_str,
+            "open_price": price,
+        }
+        self.open_positions.append(pos)
+
+        self._append_position_row("open short", 1, t_str, price, None)
+        self._update_position_state_label()
+
+    def close_long(self) -> None:
+        info = self._current_tick_info()
+        if info is None:
+            return
+        t_str, price = info
+
+        # Find earliest open long
+        idx = None
+        for i, p in enumerate(self.open_positions):
+            if p["side"] == "long":
+                idx = i
+                break
+
+        if idx is None:
+            self.status_label.config(text="Status: no long position to close")
+            return
+
+        pos = self.open_positions.pop(idx)
+        entry_price = pos["open_price"]
+
+        diff = float(price - entry_price)  # profit: close - open
+        self.settlement += diff
+
+        self._append_position_row("close long", 1, t_str, price, diff)
+        self._update_position_state_label()
+        self._update_settlement_label()
+
+    def close_short(self) -> None:
+        info = self._current_tick_info()
+        if info is None:
+            return
+        t_str, price = info
+
+        # Find earliest open short
+        idx = None
+        for i, p in enumerate(self.open_positions):
+            if p["side"] == "short":
+                idx = i
+                break
+
+        if idx is None:
+            self.status_label.config(text="Status: no short position to close")
+            return
+
+        pos = self.open_positions.pop(idx)
+        entry_price = pos["open_price"]
+
+        diff = float(entry_price - price)  # profit: open - close
+        self.settlement += diff
+
+        self._append_position_row("close short", 1, t_str, price, diff)
+        self._update_position_state_label()
+        self._update_settlement_label()
+
+
+def main() -> None:
+    # CLI-compatible signature: symbol [freq] [interval_seconds]
+    symbol = sys.argv[1] if len(sys.argv) >= 2 else "NR2601"
+
+    if len(sys.argv) >= 4:
+        try:
+            interval = float(sys.argv[3])
+        except ValueError:
+            interval = 0.5
+    else:
+        interval = 0.5  # default faster sim
+
+    root = tk.Tk()
+    app = SimApp(root, symbol=symbol, interval=interval)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
